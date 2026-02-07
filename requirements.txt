@@ -1,1 +1,3 @@
 pyTelegramBotAPI
+pyzbar
+opencv-python-headless
