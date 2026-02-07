@@ -1,20 +1,120 @@
 import os
-import sqlite3
 import telebot
+import sqlite3
+import logging
+from datetime import datetime
 
-# Define the path to the persistent volume
-# This MUST match the Mount Path you set in Step 2
-DB_FOLDER = "/app/data"
-DB_PATH = os.path.join(DB_FOLDER, "prices.db")
+# 1. SETUP LOGGING
+# This allows you to see bot activity in the Railway "Deployments > Logs" tab
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Ensure the directory exists (prevents errors on first run)
-if not os.path.exists(DB_FOLDER):
-    os.makedirs(DB_FOLDER)
+# 2. CONFIGURATION
+# TOKEN must be set in the Railway "Variables" tab
+TOKEN = os.getenv("BOT_TOKEN")
+# DB_PATH must match your Railway Volume Mount Path
+DB_PATH = "/app/data/prices.db" 
 
-def get_db_connection():
-    # This connects to the database on the permanent Volume
-    conn = sqlite3.connect(DB_PATH)
-    return conn
-
-TOKEN = os.getenv("BOT_TOKEN") # Railway will provide this
 bot = telebot.TeleBot(TOKEN)
+
+# 3. DATABASE INITIALIZATION
+def init_db():
+    try:
+        if not os.path.exists("/app/data"):
+            os.makedirs("/app/data")
+            
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item TEXT NOT NULL,
+                price REAL NOT NULL,
+                store TEXT NOT NULL,
+                date TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Database error: {e}")
+
+# 4. BOT COMMANDS
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = (
+        "🛒 **Price Tracker Bot is Online!**\n\n"
+        "Commands:\n"
+        "• `/add [item] [price] [store]` — Save a price\n"
+        "• `/compare [item]` — Find the cheapest price\n"
+        "• `/backup` — Download your database file"
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+
+@bot.message_handler(commands=['add'])
+def add_price(message):
+    try:
+        # Split into: /add, item, price, store
+        parts = message.text.split(maxsplit=3)
+        if len(parts) < 4:
+            bot.reply_to(message, "⚠️ Usage: `/add Milk 2.50 NTUC`")
+            return
+        
+        item = parts[1].lower()
+        price = float(parts[2])
+        store = parts[3].upper()
+        date_today = datetime.now().strftime("%Y-%m-%d")
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("INSERT INTO price_log (item, price, store, date) VALUES (?, ?, ?, ?)",
+                     (item, price, store, date_today))
+        conn.commit()
+        conn.close()
+        
+        bot.reply_to(message, f"✅ Recorded: **{item}** at **${price:.2f}** ({store})")
+        logger.info(f"New Entry: {item} - ${price}")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid price. Please use a number (e.g., 2.50).")
+    except Exception as e:
+        logger.error(f"Add error: {e}")
+
+@bot.message_handler(commands=['compare', 'check'])
+def compare_prices(message):
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ Usage: `/compare Milk`")
+            return
+            
+        item = parts[1].lower()
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.execute("SELECT price, store, date FROM price_log WHERE item=? ORDER BY price ASC", (item,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if rows:
+            response = f"📊 **Price history for {item.capitalize()}:**\n\n"
+            for r in rows:
+                response += f"• **${r[0]:.2f}** — {r[1]} ({r[2]})\n"
+            bot.reply_to(message, response, parse_mode="Markdown")
+        else:
+            bot.reply_to(message, f"❓ No data found for '{item}'.")
+    except Exception as e:
+        logger.error(f"Compare error: {e}")
+
+@bot.message_handler(commands=['backup'])
+def backup_db(message):
+    try:
+        with open(DB_PATH, 'rb') as f:
+            bot.send_document(message.chat.id, f, caption="📂 Here is your prices.db file.")
+    except Exception as e:
+        bot.reply_to(message, "❌ Could not retrieve backup.")
+
+# 5. START POLLING
+if __name__ == "__main__":
+    init_db()
+    logger.info("Bot is starting...")
+    # infinity_polling keeps the bot running even if it hits network hiccups
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
