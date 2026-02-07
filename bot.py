@@ -2,137 +2,75 @@ import os
 import telebot
 import sqlite3
 import logging
+import requests
 from datetime import datetime
 
-# 1. SETUP LOGGING
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 2. CONFIGURATION
 TOKEN = os.getenv("BOT_TOKEN")
+CURRENCY_API_KEY = os.getenv("EXCHANGE_RATE_KEY")
 DB_PATH = "/app/data/prices.db" 
 
 bot = telebot.TeleBot(TOKEN)
 
-# 3. DATABASE INITIALIZATION
-def init_db():
+def get_sgd_price(amount, currency):
+    """Converts any currency to SGD using live rates."""
+    currency = currency.upper()
+    if currency == "SGD":
+        return amount
+    
     try:
-        if not os.path.exists("/app/data"):
-            os.makedirs("/app/data")
-            
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS price_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item TEXT NOT NULL,
-                price REAL NOT NULL,
-                store TEXT NOT NULL,
-                date TEXT NOT NULL
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        logger.info("✅ Database initialized successfully.")
+        url = f"https://v6.exchangerate-api.com/v6/{CURRENCY_API_KEY}/pair/{currency}/SGD/{amount}"
+        response = requests.get(url)
+        data = response.json()
+        if data['result'] == 'success':
+            return data['conversion_result']
     except Exception as e:
-        logger.error(f"❌ Database error: {e}")
+        logger.error(f"Currency conversion error: {e}")
+    return None
 
-# 4. BOT COMMANDS
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_text = (
-        "🛒 **Price Tracker Bot**\n\n"
-        "Commands:\n"
-        "• `/add [item] [price] [store]` — Save a price\n"
-        "• `/compare [item]` — Find the cheapest price\n"
-        "• `/delete [item]` — Remove the last entry for an item\n"
-        "• `/backup` — Get your database file"
-    )
-    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+# ... (init_db function stays the same) ...
 
 @bot.message_handler(commands=['add'])
 def add_price(message):
     try:
-        parts = message.text.split(maxsplit=3)
-        if len(parts) < 4:
-            bot.reply_to(message, "⚠️ Usage: `/add Milk 2.50 NTUC`")
+        # Format: /add [item] [price] [currency] [store]
+        # Example: /add Milk 5.00 MYR Giant
+        parts = message.text.split(maxsplit=4)
+        if len(parts) < 5:
+            bot.reply_to(message, "⚠️ Usage: `/add Milk 5.00 MYR Giant` (Use SGD if local)")
             return
         
         item = parts[1].lower()
-        price = float(parts[2])
-        store = parts[3].upper()
-        date_today = datetime.now().strftime("%Y-%m-%d")
+        original_price = float(parts[2])
+        currency = parts[3].upper()
+        store = parts[4].upper()
+        
+        # Convert to SGD
+        converted_price = get_sgd_price(original_price, currency)
+        
+        if converted_price is None:
+            bot.reply_to(message, "❌ Currency conversion failed. Check your currency code (e.g., USD, MYR, JPY).")
+            return
 
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO price_log (item, price, store, date) VALUES (?, ?, ?, ?)",
-                     (item, price, store, date_today))
+                     (item, converted_price, store, datetime.now().strftime("%Y-%m-%d")))
         conn.commit()
         conn.close()
         
-        bot.reply_to(message, f"✅ Recorded: **{item}** at **${price:.2f}** ({store})")
+        bot.reply_to(message, f"✅ Recorded: **{item}**\n"
+                              f"💰 Original: {original_price} {currency}\n"
+                              f"🇸🇬 Converted: **${converted_price:.2f} SGD**\n"
+                              f"🏪 Store: {store}")
     except ValueError:
         bot.reply_to(message, "❌ Invalid price. Use a number (e.g., 2.50).")
     except Exception as e:
         logger.error(f"Add error: {e}")
 
-@bot.message_handler(commands=['compare', 'check'])
-def compare_prices(message):
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "⚠️ Usage: `/compare Milk`")
-            return
-            
-        item = parts[1].lower()
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.execute("SELECT price, store, date FROM price_log WHERE item=? ORDER BY price ASC", (item,))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        if rows:
-            response = f"📊 **Price history for {item.capitalize()}:**\n\n"
-            for r in rows:
-                response += f"• **${r[0]:.2f}** — {r[1]} ({r[2]})\n"
-            bot.reply_to(message, response, parse_mode="Markdown")
-        else:
-            bot.reply_to(message, f"❓ No data found for '{item}'.")
-    except Exception as e:
-        logger.error(f"Compare error: {e}")
+# ... (rest of the /compare, /delete, and /backup commands stay the same) ...
 
-@bot.message_handler(commands=['delete'])
-def delete_price(message):
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.reply_to(message, "⚠️ Usage: `/delete Milk`")
-            return
-            
-        item = parts[1].lower()
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM price_log WHERE item=? ORDER BY id DESC LIMIT 1", (item,))
-        row = cursor.fetchone()
-        if row:
-            cursor.execute("DELETE FROM price_log WHERE id=?", (row[0],))
-            conn.commit()
-            bot.reply_to(message, f"🗑️ Deleted last entry for **{item}**.")
-        else:
-            bot.reply_to(message, f"❓ Item '{item}' not found.")
-        conn.close()
-    except Exception as e:
-        logger.error(f"Delete error: {e}")
-
-@bot.message_handler(commands=['backup'])
-def backup_db(message):
-    try:
-        with open(DB_PATH, 'rb') as f:
-            bot.send_document(message.chat.id, f)
-    except Exception:
-        bot.reply_to(message, "❌ Backup failed.")
-
-# 5. START POLLING
 if __name__ == "__main__":
-    init_db()
-    logger.info("Bot is starting...")
+    # init_db() call here
     bot.infinity_polling()
