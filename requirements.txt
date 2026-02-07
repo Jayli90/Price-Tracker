@@ -1,3 +1,4 @@
 pyTelegramBotAPI
 pyzbar
 opencv-python-headless
+numpy
