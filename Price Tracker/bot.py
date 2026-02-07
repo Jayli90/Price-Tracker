@@ -1,9 +1,16 @@
 import os
-import telebot
-# ... rest of your code ...
-TOKEN = os.getenv("BOT_TOKEN") # Railway will provide this
+import sqlite3
 
-bot = telebot.TeleBot(TOKEN)
-# Important: Use the same path you set in the Railway Mount Path
-db_path = "/app/data/prices.db"
-conn = sqlite3.connect(db_path)
+# Define the path to the persistent volume
+# This MUST match the Mount Path you set in Step 2
+DB_FOLDER = "/app/data"
+DB_PATH = os.path.join(DB_FOLDER, "prices.db")
+
+# Ensure the directory exists (prevents errors on first run)
+if not os.path.exists(DB_FOLDER):
+    os.makedirs(DB_FOLDER)
+
+def get_db_connection():
+    # This connects to the database on the permanent Volume
+    conn = sqlite3.connect(DB_PATH)
+    return conn
