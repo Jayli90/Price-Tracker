@@ -2,9 +2,6 @@ import os
 import telebot
 import sqlite3
 import logging
-import cv2
-import numpy as np
-from pyzbar.pyzbar import decode
 from datetime import datetime
 
 # 1. SETUP LOGGING
@@ -13,67 +10,105 @@ logger = logging.getLogger(__name__)
 
 # 2. CONFIGURATION
 TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "/app/data/prices.db" # Matches Railway Volume Mount Path
+DB_PATH = "/app/data/prices.db" 
 
 bot = telebot.TeleBot(TOKEN)
 
 # 3. DATABASE INITIALIZATION
 def init_db():
-    if not os.path.exists("/app/data"):
-        os.makedirs("/app/data")
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS price_log 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
-                 item TEXT, price REAL, store TEXT, date TEXT)''')
-    conn.commit()
-    conn.close()
-    logger.info("Database Ready.")
+    try:
+        if not os.path.exists("/app/data"):
+            os.makedirs("/app/data")
+            
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS price_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                item TEXT NOT NULL,
+                price REAL NOT NULL,
+                store TEXT NOT NULL,
+                date TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Database error: {e}")
 
-# --- COMMANDS ---
+# 4. BOT COMMANDS
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "🛒 **Price Tracker Pro**\n\n"
-                          "• `/add [item] [price] [store]`\n"
-                          "• `/compare [item]`\n"
-                          "• `/delete [item]` (Removes last entry)\n"
-                          "• `/backup` - Get DB file\n"
-                          "• **Send a Photo** of a barcode to scan it!", parse_mode="Markdown")
+    welcome_text = (
+        "🛒 **Price Tracker Bot**\n\n"
+        "Commands:\n"
+        "• `/add [item] [price] [store]` — Save a price\n"
+        "• `/compare [item]` — Find the cheapest price\n"
+        "• `/delete [item]` — Remove the last entry for an item\n"
+        "• `/backup` — Get your database file"
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
 @bot.message_handler(commands=['add'])
 def add_price(message):
     try:
-        _, item, price, store = message.text.split(maxsplit=3)
+        parts = message.text.split(maxsplit=3)
+        if len(parts) < 4:
+            bot.reply_to(message, "⚠️ Usage: `/add Milk 2.50 NTUC`")
+            return
+        
+        item = parts[1].lower()
+        price = float(parts[2])
+        store = parts[3].upper()
+        date_today = datetime.now().strftime("%Y-%m-%d")
+
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO price_log (item, price, store, date) VALUES (?, ?, ?, ?)",
-                     (item.lower(), float(price), store.upper(), datetime.now().strftime("%Y-%m-%d")))
+                     (item, price, store, date_today))
         conn.commit()
         conn.close()
-        bot.reply_to(message, f"✅ Added **{item}** at **${float(price):.2f}** ({store.upper()})")
-    except:
-        bot.reply_to(message, "❌ Use: `/add Milk 2.50 NTUC` or `/add [barcode] 2.50 NTUC`")
+        
+        bot.reply_to(message, f"✅ Recorded: **{item}** at **${price:.2f}** ({store})")
+    except ValueError:
+        bot.reply_to(message, "❌ Invalid price. Use a number (e.g., 2.50).")
+    except Exception as e:
+        logger.error(f"Add error: {e}")
 
 @bot.message_handler(commands=['compare', 'check'])
 def compare_prices(message):
     try:
-        item = message.text.split()[1].lower()
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ Usage: `/compare Milk`")
+            return
+            
+        item = parts[1].lower()
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.execute("SELECT price, store, date FROM price_log WHERE item=? ORDER BY price ASC", (item,))
         rows = cursor.fetchall()
         conn.close()
         
         if rows:
-            res = f"📊 **Prices for {item.capitalize()}:**\n" + "\n".join([f"• **${r[0]:.2f}** @ {r[1]} ({r[2]})" for r in rows])
-            bot.reply_to(message, res, parse_mode="Markdown")
+            response = f"📊 **Price history for {item.capitalize()}:**\n\n"
+            for r in rows:
+                response += f"• **${r[0]:.2f}** — {r[1]} ({r[2]})\n"
+            bot.reply_to(message, response, parse_mode="Markdown")
         else:
-            bot.reply_to(message, "❓ No data yet.")
-    except:
-        bot.reply_to(message, "❌ Use: `/compare Milk` or `/compare [barcode]`")
+            bot.reply_to(message, f"❓ No data found for '{item}'.")
+    except Exception as e:
+        logger.error(f"Compare error: {e}")
 
 @bot.message_handler(commands=['delete'])
 def delete_price(message):
     try:
-        item = message.text.split()[1].lower()
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.reply_to(message, "⚠️ Usage: `/delete Milk`")
+            return
+            
+        item = parts[1].lower()
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM price_log WHERE item=? ORDER BY id DESC LIMIT 1", (item,))
@@ -81,42 +116,23 @@ def delete_price(message):
         if row:
             cursor.execute("DELETE FROM price_log WHERE id=?", (row[0],))
             conn.commit()
-            bot.reply_to(message, f"🗑️ Deleted last entry for {item}.")
+            bot.reply_to(message, f"🗑️ Deleted last entry for **{item}**.")
         else:
-            bot.reply_to(message, "Item not found.")
+            bot.reply_to(message, f"❓ Item '{item}' not found.")
         conn.close()
-    except:
-        bot.reply_to(message, "❌ Use: `/delete Milk`")
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
 
 @bot.message_handler(commands=['backup'])
 def backup_db(message):
     try:
         with open(DB_PATH, 'rb') as f:
             bot.send_document(message.chat.id, f)
-    except:
-        bot.reply_to(message, "Backup failed.")
+    except Exception:
+        bot.reply_to(message, "❌ Backup failed.")
 
-# --- BARCODE SCANNING ---
-
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        nparr = np.frombuffer(downloaded_file, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        barcodes = decode(img)
-        if barcodes:
-            code = barcodes[0].data.decode('utf-8')
-            bot.reply_to(message, f"🔍 **Barcode Detected:** `{code}`\n\nCopy and use:\n`/add {code} [price] [store]`", parse_mode="Markdown")
-        else:
-            bot.reply_to(message, "❌ Could not find a barcode. Try a closer, clearer photo!")
-    except Exception as e:
-        logger.error(f"Image error: {e}")
-
-# --- START ---
+# 5. START POLLING
 if __name__ == "__main__":
     init_db()
-    logger.info("Bot is polling...")
+    logger.info("Bot is starting...")
     bot.infinity_polling()
