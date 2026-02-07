@@ -118,3 +118,35 @@ if __name__ == "__main__":
     logger.info("Bot is starting...")
     # infinity_polling keeps the bot running even if it hits network hiccups
     bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
+import cv2
+from pyzbar.pyzbar import decode
+import numpy as np
+
+@bot.message_handler(content_types=['photo'])
+def handle_barcode(message):
+    try:
+        # 1. Download the photo from Telegram
+        file_info = bot.get_file(message.photo[-1].file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        
+        # 2. Convert to a format OpenCV can read
+        nparr = np.frombuffer(downloaded_file, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        # 3. Decode the barcode
+        barcodes = decode(img)
+        
+        if barcodes:
+            # Extract the first barcode found
+            barcode_data = barcodes[0].data.decode('utf-8')
+            bot.reply_to(message, f"🔍 Scanned Barcode: `{barcode_data}`\n\n"
+                                  f"Now send: `/add {barcode_data} [price] [store]`", 
+                                  parse_mode="Markdown")
+        else:
+            bot.reply_to(message, "❌ No barcode detected. Try a clearer photo!")
+            
+    except Exception as e:
+        logger.error(f"Barcode error: {e}")
+        bot.reply_to(message, "⚠️ Error processing the image.")
+
