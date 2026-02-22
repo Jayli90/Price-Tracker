@@ -11,20 +11,18 @@ logger = logging.getLogger(__name__)
 
 # 2. CONFIGURATION
 TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "/app/data/prices.db" # Volume path for Railway
+DB_PATH = "/app/data/prices.db"
 
 bot = telebot.TeleBot(TOKEN)
+user_edit_state = {} # Temporary storage for editing
 
 # 3. DATABASE INITIALIZATION & AUTO-MIGRATION
 def init_db():
     try:
         if not os.path.exists("/app/data"):
             os.makedirs("/app/data")
-            
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        
-        # Create table if it doesn't exist
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS price_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,14 +33,10 @@ def init_db():
                 date TEXT NOT NULL
             )
         ''')
-        
-        # Migration: Check if 'currency' column exists (for older databases)
         cursor.execute("PRAGMA table_info(price_log)")
         columns = [column[1] for column in cursor.fetchall()]
         if 'currency' not in columns:
             cursor.execute("ALTER TABLE price_log ADD COLUMN currency TEXT DEFAULT 'SGD'")
-            logger.info("Migrated database: Added currency column.")
-            
         conn.commit()
         conn.close()
         logger.info("✅ Database ready.")
@@ -54,15 +48,14 @@ def init_db():
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_text = (
-        "🛒 **Price Tracker Pro**\n\n"
-        "**Main Commands:**\n"
+        "🛒 **Price Tracker Pro (Buttons Edition)**\n\n"
+        "**Core Commands:**\n"
         "• `/add [item] [price] [curr] [store]` — Save a price\n"
-        "• `/list` — View tracked items (Buttons)\n"
-        "• `/compare [item]` — Quick history check\n\n"
+        "• `/list` — View prices (Interactive buttons)\n\n"
         "**Management:**\n"
-        "• `/edit [item] [price] [curr] [store]` — Update last entry\n"
-        "• `/delete [item]` — Remove last entry\n"
-        "• `/backup` — Get your database file"
+        "• `/edit` — Choose a line to update\n"
+        "• `/delete` — Choose a line to remove\n"
+        "• `/backup` — Download your database file"
     )
     bot.reply_to(message, welcome_text, parse_mode="Markdown")
 
@@ -73,9 +66,7 @@ def add_price(message):
         if len(parts) < 5:
             bot.reply_to(message, "⚠️ Usage: `/add Milk 2.50 SGD NTUC`")
             return
-        
         item, price, currency, store = parts[1].lower(), float(parts[2]), parts[3].upper(), parts[4].upper()
-        
         conn = sqlite3.connect(DB_PATH)
         conn.execute("INSERT INTO price_log (item, price, currency, store, date) VALUES (?, ?, ?, ?, ?)",
                      (item, price, currency, store, datetime.now().strftime("%Y-%m-%d")))
@@ -83,114 +74,125 @@ def add_price(message):
         conn.close()
         bot.reply_to(message, f"✅ Saved: **{item}** at **{price:.2f} {currency}** ({store})")
     except Exception:
-        bot.reply_to(message, "❌ Error. Format: `/add Milk 2.50 SGD NTUC`")
+        bot.reply_to(message, "❌ Format error. Use: `/add Milk 2.50 SGD NTUC`")
 
+# --- LIST / VIEW LOGIC ---
 @bot.message_handler(commands=['list'])
-def list_items_buttons(message):
+def list_items(message):
+    show_item_grid(message, "view")
+
+# --- DELETE LOGIC ---
+@bot.message_handler(commands=['delete'])
+def delete_start(message):
+    show_item_grid(message, "delsearch")
+
+# --- EDIT LOGIC ---
+@bot.message_handler(commands=['edit'])
+def edit_start(message):
+    show_item_grid(message, "editsearch")
+
+def show_item_grid(message, prefix):
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT item FROM price_log ORDER BY item ASC")
         rows = cursor.fetchall()
         conn.close()
-
         if rows:
             markup = types.InlineKeyboardMarkup(row_width=2)
-            buttons = [types.InlineKeyboardButton(text=r[0].capitalize(), callback_data=f"view_{r[0]}") for r in rows]
+            buttons = [types.InlineKeyboardButton(text=r[0].capitalize(), callback_data=f"{prefix}_{r[0]}") for r in rows]
             markup.add(*buttons)
-            bot.reply_to(message, "📋 **Select an item to compare prices:**", reply_markup=markup, parse_mode="Markdown")
+            prompt = "Select an item:"
+            if prefix == "delsearch": prompt = "🗑️ **Delete which item?**"
+            elif prefix == "editsearch": prompt = "✏️ **Edit which item?**"
+            bot.reply_to(message, prompt, reply_markup=markup, parse_mode="Markdown")
         else:
-            bot.reply_to(message, "📭 Your list is empty.")
+            bot.reply_to(message, "📭 Database is empty.")
     except Exception as e:
-        logger.error(f"List error: {e}")
+        logger.error(f"Grid error: {e}")
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('view_'))
-def handle_item_select(call):
-    item = call.data.replace("view_", "")
+# --- CALLBACK HANDLERS ---
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    data = call.data
+    
+    # VIEW ITEM
+    if data.startswith("view_"):
+        item = data.replace("view_", "")
+        display_prices(call, item)
+
+    # DELETE STEP 2: SHOW ENTRIES
+    elif data.startswith("delsearch_"):
+        item = data.replace("delsearch_", "")
+        show_entries(call, item, "confirmdel", "Select entry to REMOVE:")
+
+    # DELETE STEP 3: EXECUTE
+    elif data.startswith("confirmdel_"):
+        execute_delete(call)
+
+    # EDIT STEP 2: SHOW ENTRIES
+    elif data.startswith("editsearch_"):
+        item = data.replace("editsearch_", "")
+        show_entries(call, item, "selectedit", "Select entry to EDIT:")
+
+    # EDIT STEP 3: PROMPT FOR INPUT
+    elif data.startswith("selectedit_"):
+        entry_id = data.replace("selectedit_", "")
+        user_edit_state[call.from_user.id] = entry_id
+        bot.answer_callback_query(call.id)
+        msg = bot.send_message(call.message.chat.id, "⌨️ **Enter new details:**\n`item price currency store`", parse_mode="Markdown")
+        bot.register_next_step_handler(msg, process_edit_save)
+
+def display_prices(call, item):
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.execute("SELECT price, currency, store, date FROM price_log WHERE item=? ORDER BY currency ASC, price ASC", (item,))
-    rows = cursor.fetchall()
+    rows = conn.execute("SELECT price, currency, store, date FROM price_log WHERE item=? ORDER BY currency, price ASC", (item,)).fetchall()
     conn.close()
+    res = f"📊 **{item.capitalize()}** history:\n\n" + "\n".join([f"• {r[0]:.2f} {r[1]} @ {r[2]} ({r[3]})" for r in rows])
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, res, parse_mode="Markdown")
 
-    if rows:
-        response = f"📊 **Price history for {item.capitalize()}:**\n\n"
-        for r in rows:
-            response += f"• **{r[0]:.2f} {r[1]}** — {r[2]} ({r[3]})\n"
-        bot.answer_callback_query(call.id) # Stops the loading spinner
-        bot.send_message(call.message.chat.id, response, parse_mode="Markdown")
-    else:
-        bot.answer_callback_query(call.id, "No data found.")
+def show_entries(call, item, prefix, text):
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT id, price, currency, store, date FROM price_log WHERE item=? ORDER BY id DESC LIMIT 5", (item,)).fetchall()
+    conn.close()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for r in rows:
+        markup.add(types.InlineKeyboardButton(text=f"{r[1]} {r[2]} @ {r[3]} ({r[4]})", callback_data=f"{prefix}_{r[0]}"))
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"⚠️ **{text}**", reply_markup=markup, parse_mode="Markdown")
 
-@bot.message_handler(commands=['compare', 'check'])
-def compare_prices(message):
+def execute_delete(call):
+    eid = call.data.replace("confirmdel_", "")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM price_log WHERE id=?", (eid,))
+    conn.commit()
+    conn.close()
+    bot.answer_callback_query(call.id, "Deleted!")
+    bot.edit_message_text("✅ Entry removed.", call.message.chat.id, call.message.id)
+
+def process_edit_save(message):
+    uid = message.from_user.id
+    if uid not in user_edit_state: return
     try:
-        item = message.text.split()[1].lower()
+        p = message.text.split(maxsplit=3)
         conn = sqlite3.connect(DB_PATH)
-        cursor = conn.execute("SELECT price, currency, store, date FROM price_log WHERE item=? ORDER BY currency ASC, price ASC", (item,))
-        rows = cursor.fetchall()
+        conn.execute("UPDATE price_log SET item=?, price=?, currency=?, store=?, date=? WHERE id=?", 
+                     (p[0].lower(), float(p[1]), p[2].upper(), p[3].upper(), datetime.now().strftime("%Y-%m-%d"), user_edit_state[uid]))
+        conn.commit()
         conn.close()
-        
-        if rows:
-            response = f"📊 **Price history for {item.capitalize()}:**\n\n" + "\n".join([f"• **{r[0]:.2f} {r[1]}** — {r[2]} ({r[3]})" for r in rows])
-            bot.reply_to(message, response, parse_mode="Markdown")
-        else:
-            bot.reply_to(message, f"❓ No records for '{item}'.")
-    except:
-        bot.reply_to(message, "⚠️ Usage: `/compare Milk`")
-
-@bot.message_handler(commands=['edit'])
-def edit_price(message):
-    try:
-        parts = message.text.split(maxsplit=4)
-        if len(parts) < 5:
-            bot.reply_to(message, "⚠️ Usage: `/edit [item] [price] [curr] [store]`")
-            return
-        
-        item, new_price, new_curr, new_store = parts[1].lower(), float(parts[2]), parts[3].upper(), parts[4].upper()
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM price_log WHERE item=? ORDER BY id DESC LIMIT 1", (item,))
-        row = cursor.fetchone()
-
-        if row:
-            cursor.execute("UPDATE price_log SET price=?, currency=?, store=?, date=? WHERE id=?", 
-                           (new_price, new_curr, new_store, datetime.now().strftime("%Y-%m-%d"), row[0]))
-            conn.commit()
-            bot.reply_to(message, f"✏️ Updated last **{item}** entry successfully.")
-        else:
-            bot.reply_to(message, f"❓ Item '{item}' not found.")
-        conn.close()
+        bot.reply_to(message, "✅ Entry updated!")
+        del user_edit_state[uid]
     except Exception:
-        bot.reply_to(message, "❌ Edit failed. Format: `/edit Milk 2.50 SGD Giant`")
-
-@bot.message_handler(commands=['delete'])
-def delete_price(message):
-    try:
-        item = message.text.split()[1].lower()
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM price_log WHERE item=? ORDER BY id DESC LIMIT 1", (item,))
-        row = cursor.fetchone()
-        if row:
-            cursor.execute("DELETE FROM price_log WHERE id=?", (row[0],))
-            conn.commit()
-            bot.reply_to(message, f"🗑️ Deleted last entry for **{item}**.")
-        else:
-            bot.reply_to(message, "❓ Item not found.")
-        conn.close()
-    except:
-        bot.reply_to(message, "⚠️ Usage: `/delete Milk`")
+        bot.reply_to(message, "❌ Error. Try /edit again.")
 
 @bot.message_handler(commands=['backup'])
 def backup_db(message):
     try:
         with open(DB_PATH, 'rb') as f:
-            bot.send_document(message.chat.id, f, caption="📂 Your current database.")
+            bot.send_document(message.chat.id, f)
     except Exception:
         bot.reply_to(message, "❌ Backup failed.")
 
-# 5. START POLLING
 if __name__ == "__main__":
     init_db()
-    logger.info("Bot is starting...")
-    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+    bot.infinity_polling()
